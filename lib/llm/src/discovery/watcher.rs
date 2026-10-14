@@ -2191,6 +2191,7 @@ mod tests {
             crate::test_utils::assert_isolated_success(&output);
             return;
         }
+        use dynamo_kv_router::plugins::worker_selection::WorkerCandidates;
         use dynamo_kv_router::scheduling::{
             ClassifyEvent, ClassifyFuture, ClassifyRequest, RequestClassifier,
         };
@@ -2203,7 +2204,11 @@ mod tests {
         }
         #[async_trait]
         impl RequestClassifier for RejectingClassifier {
-            fn classify(&mut self, _request: ClassifyRequest) -> ClassifyFuture {
+            fn classify(
+                &mut self,
+                _request: ClassifyRequest,
+                _workers: WorkerCandidates<'_>,
+            ) -> ClassifyFuture {
                 self.calls += 1;
                 self.events
                     .send((self.instance, "classify", self.calls))
