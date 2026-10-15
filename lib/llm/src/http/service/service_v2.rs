@@ -967,6 +967,9 @@ impl HttpService {
 
         let state = self.state.clone();
         let state_cancel = state.cancel_token().clone();
+        // Telemetry continues during drain and stops on every service exit path.
+        let publisher_cancel = CancellationToken::new();
+        let _publisher_guard = publisher_cancel.clone().drop_guard();
 
         if self.enable_tls {
             if listener.is_some() {
@@ -1029,7 +1032,7 @@ impl HttpService {
 
             // Spawn canary after all fallible startup so it won't leak on early errors
             tokio::spawn(tokio_metrics_and_canary_loop(cancel_token.clone()));
-            self.start_frontend_load_publisher(&cancel_token);
+            self.start_frontend_load_publisher(&publisher_cancel);
 
             tokio::pin!(server);
             tokio::select! {
@@ -1095,7 +1098,7 @@ impl HttpService {
 
             // Spawn canary after all fallible startup so it won't leak on early errors
             tokio::spawn(tokio_metrics_and_canary_loop(cancel_token.clone()));
-            self.start_frontend_load_publisher(&cancel_token);
+            self.start_frontend_load_publisher(&publisher_cancel);
 
             let handle = server_handle.unwrap_or_default();
             let server = axum_server::from_tcp(std_listener)
