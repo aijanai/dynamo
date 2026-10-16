@@ -3,7 +3,8 @@
 
 //! Worker input groups, stored snapshots, and component-scoped borrowed views.
 
-use crate::protocols::{SharedCacheHits, WorkerWithDpRank};
+use crate::protocols::{SharedCacheHits, WorkerConfigLike, WorkerWithDpRank};
+use crate::sequences::WorkerLoadProjection;
 use std::ops::BitOr;
 
 /// Host-owned row materialized once for the union of component input requirements.
@@ -15,30 +16,47 @@ pub(crate) struct CandidateData {
     pub(crate) preferred_taint_multiplier: Option<f64>,
 }
 
+/// Static worker info by view row. Hosts look it up only when a component asks, so rows
+/// never carry it.
+pub(crate) type WorkerInfoLookup<'a> = &'a dyn Fn(usize) -> WorkerInfo;
+
 /// A borrowed view of one worker, restricted to this component's declared inputs.
 #[derive(Clone, Copy)]
 pub struct WorkerCandidate<'a> {
     data: &'a CandidateData,
     inputs: WorkerInputs,
+    // Row passed to `info`. A u32 packs beside `inputs`, keeping the view at five words.
+    row: u32,
     cache_snapshot: &'a CacheSnapshot<'a>,
+    info: WorkerInfoLookup<'a>,
 }
 
 impl<'a> WorkerCandidate<'a> {
+    /// A single-worker view; `info` is called with row 0.
     pub(crate) fn new(
         data: &'a CandidateData,
         inputs: WorkerInputs,
         cache_snapshot: &'a CacheSnapshot<'a>,
+        info: WorkerInfoLookup<'a>,
     ) -> Self {
         Self {
             data,
             inputs,
+            row: 0,
             cache_snapshot,
+            info,
         }
     }
 
     /// Worker identity is always available.
     pub fn worker(self) -> WorkerWithDpRank {
         self.data.worker
+    }
+
+    /// This worker's identity and advertised capacity. Always available, with no input group
+    /// to declare; the host looks it up on each call.
+    pub fn info(self) -> WorkerInfo {
+        (self.info)(self.row as usize)
     }
 
     /// Read this worker's cache snapshot only when this component declared CACHE.
@@ -77,6 +95,8 @@ pub struct WorkerCandidates<'a> {
     rows: &'a [CandidateData],
     inputs: WorkerInputs,
     cache_snapshot: &'a CacheSnapshot<'a>,
+    // Indexed by row in `rows`.
+    info: WorkerInfoLookup<'a>,
 }
 
 impl<'a> WorkerCandidates<'a> {
@@ -84,11 +104,24 @@ impl<'a> WorkerCandidates<'a> {
         rows: &'a [CandidateData],
         inputs: WorkerInputs,
         cache_snapshot: &'a CacheSnapshot<'a>,
+        info: WorkerInfoLookup<'a>,
     ) -> Self {
+        debug_assert!(u32::try_from(rows.len()).is_ok());
         Self {
             rows,
             inputs,
             cache_snapshot,
+            info,
+        }
+    }
+
+    fn candidate(self, row: usize, data: &'a CandidateData) -> WorkerCandidate<'a> {
+        WorkerCandidate {
+            data,
+            inputs: self.inputs,
+            row: row as u32,
+            cache_snapshot: self.cache_snapshot,
+            info: self.info,
         }
     }
 
@@ -104,9 +137,7 @@ impl<'a> WorkerCandidates<'a> {
 
     /// Borrow one row with this scorer's input permissions, or None for an out-of-range index.
     pub fn get(self, row: usize) -> Option<WorkerCandidate<'a>> {
-        self.rows
-            .get(row)
-            .map(|data| WorkerCandidate::new(data, self.inputs, self.cache_snapshot))
+        self.rows.get(row).map(|data| self.candidate(row, data))
     }
 
     /// Iterate over the surviving workers without copying their data.
@@ -115,7 +146,8 @@ impl<'a> WorkerCandidates<'a> {
     ) -> impl ExactSizeIterator<Item = WorkerCandidate<'a>> + DoubleEndedIterator + Clone {
         self.rows
             .iter()
-            .map(move |data| WorkerCandidate::new(data, self.inputs, self.cache_snapshot))
+            .enumerate()
+            .map(move |(row, data)| self.candidate(row, data))
     }
 }
 
@@ -172,6 +204,8 @@ pub(crate) struct CacheSnapshot<'a> {
 pub(crate) struct WorkerInputRows {
     inputs: WorkerInputs,
     rows: Vec<CandidateData>,
+    // Index-aligned with `rows`. The rows outlive the worker map, so they own a copy.
+    infos: Vec<WorkerInfo>,
     shared_hits: Option<SharedCacheHits>,
     has_tier_matches: bool,
 }
@@ -180,11 +214,14 @@ impl WorkerInputRows {
     pub(crate) fn new(
         inputs: WorkerInputs,
         rows: Vec<CandidateData>,
+        infos: Vec<WorkerInfo>,
         cache_snapshot: CacheSnapshot<'_>,
     ) -> Self {
+        debug_assert_eq!(rows.len(), infos.len());
         Self {
             inputs,
             rows,
+            infos,
             shared_hits: if inputs.contains(WorkerInputs::CACHE) {
                 cache_snapshot.shared_hits.cloned()
             } else {
@@ -199,6 +236,7 @@ impl WorkerInputRows {
         Self {
             inputs: WorkerInputs::NONE,
             rows: Vec::new(),
+            infos: Vec::new(),
             shared_hits: None,
             has_tier_matches: false,
         }
@@ -210,10 +248,12 @@ impl WorkerInputRows {
             shared_hits: self.shared_hits.as_ref(),
             has_tier_matches: self.has_tier_matches,
         };
+        let info = |row: usize| self.infos[row];
         read(WorkerCandidates::new(
             &self.rows,
             self.inputs,
             &cache_snapshot,
+            &info,
         ))
     }
 }
@@ -292,12 +332,96 @@ pub struct WorkerLoadInput {
     pub(crate) active_requests: usize,
 }
 
+/// Advertised capacity of one worker rank, from its runtime config. It changes only when
+/// the worker registers again, so hosts serve it from cached discovery state, not per request.
+/// Components read it through [`WorkerInfo::capacity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerCapacity {
+    // `UNREPORTED` stands for `None`; it keeps rows two words smaller than `Option<u64>`.
+    max_num_batched_tokens: u64,
+    total_kv_blocks: u64,
+}
+
+impl Default for WorkerCapacity {
+    fn default() -> Self {
+        Self::new(None, None)
+    }
+}
+
+impl WorkerCapacity {
+    const UNREPORTED: u64 = u64::MAX;
+
+    pub fn new(max_num_batched_tokens: Option<u64>, total_kv_blocks: Option<u64>) -> Self {
+        Self {
+            max_num_batched_tokens: max_num_batched_tokens.unwrap_or(Self::UNREPORTED),
+            total_kv_blocks: total_kv_blocks.unwrap_or(Self::UNREPORTED),
+        }
+    }
+
+    /// Read the capacity a worker advertises in its runtime config.
+    pub fn of<C: WorkerConfigLike>(config: &C) -> Self {
+        Self::new(config.max_num_batched_tokens(), config.total_kv_blocks())
+    }
+
+    /// Prefill tokens the rank batches per engine step, when reported.
+    pub fn max_num_batched_tokens(self) -> Option<u64> {
+        (self.max_num_batched_tokens != Self::UNREPORTED).then_some(self.max_num_batched_tokens)
+    }
+
+    /// Total KV blocks on the rank, when reported. This is capacity, not free blocks.
+    pub fn total_kv_blocks(self) -> Option<u64> {
+        (self.total_kv_blocks != Self::UNREPORTED).then_some(self.total_kv_blocks)
+    }
+}
+
+/// Static facts about one worker rank: its identity and the capacity its runtime config
+/// advertises. Every component can read it without declaring an input group. It changes
+/// only when the worker registers again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerInfo {
+    worker: WorkerWithDpRank,
+    capacity: WorkerCapacity,
+}
+
+impl WorkerInfo {
+    pub fn new(worker: WorkerWithDpRank, capacity: WorkerCapacity) -> Self {
+        Self { worker, capacity }
+    }
+
+    /// Read a rank's info from its worker's runtime config.
+    pub fn of<C: WorkerConfigLike>(worker: WorkerWithDpRank, config: &C) -> Self {
+        Self::new(worker, WorkerCapacity::of(config))
+    }
+
+    /// Worker ID and data-parallel rank.
+    pub fn worker(&self) -> WorkerWithDpRank {
+        self.worker
+    }
+
+    /// Prefill tokens the rank batches per engine step, when reported.
+    pub fn max_num_batched_tokens(&self) -> Option<u64> {
+        self.capacity.max_num_batched_tokens()
+    }
+
+    /// Total KV blocks on the rank, when reported. This is capacity, not free blocks.
+    pub fn total_kv_blocks(&self) -> Option<u64> {
+        self.capacity.total_kv_blocks()
+    }
+
+    /// Both advertised values, as [`crate::scheduling::BusyThresholds::has_room`] takes them.
+    pub fn capacity(&self) -> WorkerCapacity {
+        self.capacity
+    }
+}
+
 /// Borrowed, index-aligned view of one custom picker's requested worker inputs.
 #[derive(Clone, Copy)]
 pub struct WorkerInputView<'a> {
     pub(crate) candidates: &'a [ScoredWorkerCandidate],
     pub(crate) cache: Option<WorkerCacheInputs<'a>>,
     pub(crate) load: Option<&'a [WorkerLoadInput]>,
+    // Indexed by row in `candidates`.
+    pub(crate) info: WorkerInfoLookup<'a>,
 }
 
 impl CandidateData {
@@ -392,6 +516,20 @@ impl<'a> WorkerCacheInput<'a> {
 }
 
 impl WorkerLoadInput {
+    /// Convert the host's load projection into a `LOAD` row. Hosts outside this crate, such
+    /// as offline replay, use it to judge capacity on the same row worker selection reads.
+    #[doc(hidden)]
+    pub fn from_projection(load: WorkerLoadProjection) -> Self {
+        Self {
+            available: true,
+            active_prefill_tokens: load.active_prefill_tokens,
+            decode_cost_blocks: load.potential_decode_blocks() as f64,
+            active_requests: load.active_requests,
+        }
+    }
+}
+
+impl WorkerLoadInput {
     /// Whether the host supplied a load projection for this worker in this selection.
     /// False distinguishes a missing observation from an observed idle worker.
     pub fn is_available(&self) -> bool {
@@ -428,5 +566,11 @@ impl<'a> WorkerInputView<'a> {
     /// Return index-aligned active-load inputs when the picker requested them.
     pub fn load(self) -> Option<&'a [WorkerLoadInput]> {
         self.load
+    }
+
+    /// Return static info for the candidate at `row`, or None for an out-of-range row.
+    /// Always available, with no input group to declare; the host looks it up on each call.
+    pub fn info(self, row: usize) -> Option<WorkerInfo> {
+        (row < self.candidates.len()).then(|| (self.info)(row))
     }
 }
