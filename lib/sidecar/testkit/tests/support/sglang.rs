@@ -231,6 +231,7 @@ impl WireFixture for Fixture {
             .stop_token_ids
             .iter()
             .chain(&request.stop_conditions.stop_token_ids_hidden)
+            .chain(&request.stop_conditions.stop_token_ids_visible)
             .flatten()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
