@@ -20,9 +20,13 @@ if not HAS_GMS:
 
 import msgspec
 from _fake_vmm import FakeVMM
+from blake3 import blake3
 from gpu_memory_service.common.locks import GrantedLockType, RequestedLockType
 from gpu_memory_service.snapshot import disk as snapshot_disk
-from gpu_memory_service.snapshot.transfer import TransferBackendKind
+from gpu_memory_service.snapshot.transfer import (
+    TransferBackendKind,
+    verify_file_source_digests,
+)
 from gpu_memory_service.v1.client.session import _GMSClientSession
 from gpu_memory_service.v1.protocol import AllocationRecord
 from gpu_memory_service.v1.server.rpc import GMSRPCServer, GMSServerMemoryManager
@@ -75,11 +79,18 @@ class _ByteVMM(FakeVMM):
 class _Writer:
     vmm: _ByteVMM
 
-    def __init__(self, path, *, device, hash_name=None):
+    def __init__(self, path, *, device, hash_name=None, hash_threads=1):
         assert device == 0
+        assert hash_threads > 0
         self._path = Path(path)
         self._data = bytearray()
-        self._hasher = hashlib.new(hash_name) if hash_name is not None else None
+        self._hasher = (
+            blake3()
+            if hash_name == "blake3"
+            else hashlib.new(hash_name)
+            if hash_name is not None
+            else None
+        )
 
     def __enter__(self):
         return self
@@ -107,6 +118,7 @@ class _Transfer:
     def restore(self, targets):
         if self._fail:
             raise RuntimeError("restore failed")
+        verify_file_source_digests(self._sources, max_workers=1)
         for source in self._sources:
             target = targets[source.allocation_id]
             shard = Path(source.file_path).read_bytes()
@@ -171,7 +183,7 @@ def _map(session, record, vmm, access):
     )
 
 
-def test_device_writer_hashes_the_exact_multi_chunk_file(tmp_path, monkeypatch):
+def test_device_writer_blake3_hashes_the_exact_multi_chunk_file(tmp_path, monkeypatch):
     source = bytes(range(11))
     base = 1000
 
@@ -209,7 +221,7 @@ def test_device_writer_hashes_the_exact_multi_chunk_file(tmp_path, monkeypatch):
         device=0,
         buffers=2,
         chunk_size=3,
-        hash_name="sha256",
+        hash_name="blake3",
     )
     with writer:
         writer.write_device(base, 5)
@@ -218,7 +230,7 @@ def test_device_writer_hashes_the_exact_multi_chunk_file(tmp_path, monkeypatch):
             writer.hexdigest()
 
     assert shard.read_bytes() == source
-    assert writer.hexdigest() == hashlib.sha256(source).hexdigest()
+    assert writer.hexdigest() == blake3(source).hexdigest()
     assert len(closed) == 2
 
 
@@ -254,7 +266,7 @@ def test_legacy_shard_writer_does_not_require_hash_support(tmp_path, monkeypatch
 
 
 @pytest.mark.timeout(10)
-@pytest.mark.parametrize("schema_version", [1, 2])
+@pytest.mark.parametrize("schema_version", [1, 2, 3])
 def test_weight_artifact_round_trip_preserves_exact_ids_and_bytes(
     tmp_path,
     monkeypatch,
@@ -305,12 +317,12 @@ def test_weight_artifact_round_trip_preserves_exact_ids_and_bytes(
         (allocation.allocation_id, allocation.aligned_size)
         for allocation in manifest.allocations
     ] == [(record.allocation_id, record.aligned_size) for record in records]
-    assert manifest.version == 2
+    assert manifest.version == 3
     assert len(manifest.shards) == 2
     for shard in manifest.shards:
         shard_path = artifact / shard.path
         assert shard.byte_count == shard_path.stat().st_size
-        assert shard.sha256 == hashlib.sha256(shard_path.read_bytes()).hexdigest()
+        assert shard.blake3 == blake3(shard_path.read_bytes()).hexdigest()
 
     if schema_version == 1:
         legacy_manifest = {
@@ -318,6 +330,22 @@ def test_weight_artifact_round_trip_preserves_exact_ids_and_bytes(
             "allocations": msgspec.to_builtins(manifest.allocations),
         }
         (artifact / "manifest.json").write_bytes(msgspec.json.encode(legacy_manifest))
+    elif schema_version == 2:
+        sha256_manifest = {
+            "version": 2,
+            "allocations": msgspec.to_builtins(manifest.allocations),
+            "shards": [
+                {
+                    "path": shard.path,
+                    "byte_count": shard.byte_count,
+                    "sha256": hashlib.sha256(
+                        (artifact / shard.path).read_bytes()
+                    ).hexdigest(),
+                }
+                for shard in manifest.shards
+            ],
+        }
+        (artifact / "manifest.json").write_bytes(msgspec.json.encode(sha256_manifest))
 
     target_vmm = _ByteVMM()
     backend = _Backend(target_vmm)
@@ -352,7 +380,7 @@ def test_weight_artifact_round_trip_preserves_exact_ids_and_bytes(
     assert backend_calls[0][0] == transfer_backend.value
     assert backend_calls[0][1].device == 0
     assert any(
-        "SHA-256 integrity verification is unavailable" in warning
+        "content-digest integrity verification is unavailable" in warning
         for warning in warnings
     ) == (schema_version == 1)
 
@@ -375,13 +403,13 @@ def test_failed_weight_load_does_not_publish_partial_epoch(
     (artifact / "manifest.json").write_bytes(
         msgspec.json.encode(
             weight_artifact.WeightArtifactManifest(
-                2,
+                3,
                 (allocation,),
                 (
                     weight_artifact.WeightArtifactShard(
                         "shard.bin",
                         len(shard_bytes),
-                        hashlib.sha256(shard_bytes).hexdigest(),
+                        blake3(shard_bytes).hexdigest(),
                     ),
                 ),
             )
@@ -413,7 +441,7 @@ def _write_test_artifact(
     shard_bytes: bytes = bytes(64),
     digest: str | None = None,
     declared_byte_count: int | None = None,
-    version: int = 2,
+    version: int = 3,
     include_shard: bool = True,
 ) -> None:
     artifact.mkdir()
@@ -423,43 +451,39 @@ def _write_test_artifact(
         "shard.bin",
         0,
     )
-    shards = (
-        weight_artifact.WeightArtifactShard(
-            "shard.bin",
-            len(shard_bytes) if declared_byte_count is None else declared_byte_count,
-            digest or hashlib.sha256(shard_bytes).hexdigest(),
-        ),
-    )
     manifest = {
         "version": version,
         "allocations": [msgspec.to_builtins(allocation)],
     }
     if include_shard:
-        manifest["shards"] = [msgspec.to_builtins(shards[0])]
+        hash_name = "sha256" if version == 2 else "blake3"
+        expected_digest = (
+            hashlib.sha256(shard_bytes).hexdigest()
+            if version == 2
+            else blake3(shard_bytes).hexdigest()
+        )
+        manifest["shards"] = [
+            {
+                "path": "shard.bin",
+                "byte_count": len(shard_bytes)
+                if declared_byte_count is None
+                else declared_byte_count,
+                hash_name: digest or expected_digest,
+            }
+        ]
     (artifact / "manifest.json").write_bytes(msgspec.json.encode(manifest))
     (artifact / "shard.bin").write_bytes(shard_bytes)
 
 
-@pytest.mark.parametrize(
-    ("digest", "match"),
-    [
-        ("0" * 63, "invalid SHA-256"),
-        ("0" * 64, "SHA-256 mismatch"),
-    ],
-)
-def test_weight_artifact_rejects_invalid_shard_digest(
-    tmp_path,
-    digest,
-    match,
-) -> None:
+def test_weight_artifact_rejects_invalid_shard_digest(tmp_path) -> None:
     artifact = tmp_path / "artifact"
-    _write_test_artifact(artifact, digest=digest)
+    _write_test_artifact(artifact, digest="0" * 63)
 
-    with pytest.raises(RuntimeError, match=match):
+    with pytest.raises(RuntimeError, match="invalid BLAKE3"):
         weight_artifact._load_manifest(str(artifact), 64)
 
 
-def test_weight_artifact_rejects_same_length_shard_mutation_before_restore(
+def test_weight_artifact_rejects_same_length_shard_mutation_without_publish(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -468,26 +492,31 @@ def test_weight_artifact_rejects_same_length_shard_mutation_before_restore(
     (artifact / "shard.bin").write_bytes(bytes([1]) + bytes(63))
     vmm = _ByteVMM()
     _configure_device(monkeypatch, vmm)
-
-    def unexpected_backend(*_args, **_kwargs):
-        pytest.fail("digest validation must run before backend creation")
-
-    def unexpected_session(*_args, **_kwargs):
-        pytest.fail("digest validation must run before session creation")
-
+    backend = _Backend(vmm)
     monkeypatch.setattr(
         weight_artifact,
         "create_transfer_backend",
-        unexpected_backend,
+        lambda *_args, **_kwargs: backend,
     )
-    monkeypatch.setattr(weight_artifact, "_GMSClientSession", unexpected_session)
+
+    socket_path = str(tmp_path / "weights.sock")
+    with _server(socket_path, vmm) as manager:
+        with pytest.raises(RuntimeError, match="BLAKE3 mismatch"):
+            weight_artifact.load_weights(str(artifact), socket_path, 0)
+        assert not manager._sessions._committed
+        assert not vmm.server_handles
+    assert backend.closed
+
+
+def test_v2_sha256_artifact_detects_same_length_mutation(tmp_path) -> None:
+    artifact = tmp_path / "artifact"
+    _write_test_artifact(artifact, version=2)
+    _manifest, sources = weight_artifact._load_manifest(str(artifact), 64)
+    assert sources[0].file_hash_name == "sha256"
+    (artifact / "shard.bin").write_bytes(bytes([1]) + bytes(63))
 
     with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
-        weight_artifact.load_weights(
-            str(artifact),
-            str(tmp_path / "unused.sock"),
-            0,
-        )
+        verify_file_source_digests(sources, max_workers=1)
 
 
 def test_weight_artifact_validates_external_sharded_ssd_digest(tmp_path) -> None:
@@ -499,7 +528,7 @@ def test_weight_artifact_validates_external_sharded_ssd_digest(tmp_path) -> None
     shard_path.write_bytes(shard_bytes)
     artifact.mkdir()
     manifest = weight_artifact.WeightArtifactManifest(
-        2,
+        3,
         (
             weight_artifact.WeightArtifactAllocation(
                 "weight",
@@ -512,16 +541,22 @@ def test_weight_artifact_validates_external_sharded_ssd_digest(tmp_path) -> None
             weight_artifact.WeightArtifactShard(
                 str(shard_path),
                 len(shard_bytes),
-                hashlib.sha256(shard_bytes).hexdigest(),
+                blake3(shard_bytes).hexdigest(),
             ),
         ),
     )
     (artifact / "manifest.json").write_bytes(msgspec.json.encode(manifest))
 
-    weight_artifact._load_manifest(str(artifact), 64, (str(external_root),))
+    _manifest, sources = weight_artifact._load_manifest(
+        str(artifact), 64, (str(external_root),)
+    )
+    assert sources[0].file_byte_count == len(shard_bytes)
+    assert sources[0].file_hash_name == "blake3"
+    assert sources[0].file_hash_digest == blake3(shard_bytes).hexdigest()
+    assert verify_file_source_digests(sources, max_workers=1) == (1, 64)
     shard_path.write_bytes(bytes([1]) + bytes(63))
-    with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
-        weight_artifact._load_manifest(str(artifact), 64, (str(external_root),))
+    with pytest.raises(RuntimeError, match="BLAKE3 mismatch"):
+        verify_file_source_digests(sources, max_workers=1)
 
 
 def test_weight_artifact_requires_integrity_record_for_every_shard(tmp_path) -> None:
@@ -551,7 +586,7 @@ def test_weight_artifact_rejects_unreferenced_shard_integrity_record(tmp_path) -
         {
             "path": "extra.bin",
             "byte_count": 64,
-            "sha256": hashlib.sha256(bytes(64)).hexdigest(),
+            "blake3": blake3(bytes(64)).hexdigest(),
         }
     )
     (artifact / "manifest.json").write_bytes(msgspec.json.encode(manifest))
@@ -607,7 +642,7 @@ def test_legacy_artifact_warns_and_cannot_detect_same_length_corruption(
     assert before.version == 1
     assert len(warnings) == 2
     assert all(
-        "SHA-256 integrity verification is unavailable" in warning
+        "content-digest integrity verification is unavailable" in warning
         for warning in warnings
     )
     assert all(
@@ -617,7 +652,7 @@ def test_legacy_artifact_warns_and_cannot_detect_same_length_corruption(
     assert all(str(artifact) in warning for warning in warnings)
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 @pytest.mark.parametrize(
     "damage", ["missing", "truncated", "escape", "duplicate", "offset"]
 )
@@ -628,7 +663,7 @@ def test_public_loader_rejects_structural_damage_before_backend_or_session(
     damage,
 ) -> None:
     artifact = tmp_path / "artifact"
-    _write_test_artifact(artifact, version=version, include_shard=version == 2)
+    _write_test_artifact(artifact, version=version, include_shard=version != 1)
     manifest_path = artifact / "manifest.json"
     manifest = msgspec.json.decode(manifest_path.read_bytes())
     if damage == "missing":
@@ -667,7 +702,7 @@ def test_public_loader_rejects_structural_damage_before_backend_or_session(
         )
 
 
-@pytest.mark.parametrize("version", [0, 3])
+@pytest.mark.parametrize("version", [0, 4])
 def test_unknown_artifact_version_is_rejected(tmp_path, version):
     artifact = tmp_path / "artifact"
     _write_test_artifact(artifact, version=version)
@@ -675,7 +710,7 @@ def test_unknown_artifact_version_is_rejected(tmp_path, version):
         weight_artifact._load_manifest(str(artifact), 64)
 
 
-def test_v2_empty_shards_never_falls_back_to_legacy(tmp_path):
+def test_v3_empty_shards_never_falls_back_to_legacy(tmp_path):
     artifact = tmp_path / "artifact"
     _write_test_artifact(artifact)
     manifest_path = artifact / "manifest.json"
@@ -686,7 +721,7 @@ def test_v2_empty_shards_never_falls_back_to_legacy(tmp_path):
         weight_artifact._load_manifest(str(artifact), 64)
 
 
-def test_changing_v2_version_alone_does_not_bypass_verification(tmp_path):
+def test_changing_v3_version_alone_does_not_bypass_verification(tmp_path):
     artifact = tmp_path / "artifact"
     _write_test_artifact(artifact, version=1, include_shard=True)
     with pytest.raises(msgspec.ValidationError, match="unknown field.*shards"):

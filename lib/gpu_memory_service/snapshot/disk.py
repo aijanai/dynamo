@@ -11,6 +11,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional, Sequence, Tuple
 
+from blake3 import blake3
 from gpu_memory_service.common.protocol.messages import GetAllocationResponse
 from gpu_memory_service.common.vmm import get_vmm
 from gpu_memory_service.snapshot.backends.pinned_host import (
@@ -19,6 +20,7 @@ from gpu_memory_service.snapshot.backends.pinned_host import (
     make_pinned_copy_slots,
 )
 from gpu_memory_service.snapshot.model import AllocationEntry, SaveManifest
+from gpu_memory_service.snapshot.transfer import blake3_threads_per_shard
 
 _SAVE_COPY_BUFFERS = 1
 
@@ -61,6 +63,7 @@ class DeviceToFileWriter:
         buffers: int = _SAVE_COPY_BUFFERS,
         chunk_size: int = PINNED_COPY_CHUNK_SIZE,
         hash_name: Optional[str] = None,
+        hash_threads: int = 1,
     ) -> None:
         self._file_path = file_path
         buffers = int(buffers)
@@ -69,7 +72,15 @@ class DeviceToFileWriter:
             raise ValueError("buffers must be positive")
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
-        self._hasher = hashlib.new(hash_name) if hash_name is not None else None
+        if hash_threads <= 0:
+            raise ValueError("hash_threads must be positive")
+        self._hasher = (
+            blake3(max_threads=hash_threads)
+            if hash_name == "blake3"
+            else hashlib.new(hash_name)
+            if hash_name is not None
+            else None
+        )
         self._vmm = get_vmm()
         if device is not None:
             self._vmm.runtime_set_device(device)
@@ -104,7 +115,11 @@ class DeviceToFileWriter:
             chunk_view = slot.view[:chunk_size]
             try:
                 if self._hasher is not None:
-                    self._hasher.update(chunk_view)
+                    digest_view = chunk_view.cast("B")
+                    try:
+                        self._hasher.update(digest_view)
+                    finally:
+                        digest_view.release()
                 _write_all_from_view(self._fd, chunk_view, self._file_path)
             finally:
                 chunk_view.release()
@@ -182,7 +197,7 @@ def write_device_shards(
     return placements
 
 
-def write_device_shards_with_sha256(
+def write_device_shards_with_blake3(
     extents: Sequence[Tuple[int, int]],
     shard_dirs: Sequence[str],
     *,
@@ -191,7 +206,7 @@ def write_device_shards_with_sha256(
     max_workers: int,
     relative_to: Optional[str] = None,
 ) -> tuple[list[Tuple[str, int]], dict[str, str]]:
-    """Write device shards and return placements plus streaming SHA-256 digests."""
+    """Write device shards and return placements plus streaming BLAKE3 digests."""
     return _write_device_shards(
         extents,
         shard_dirs,
@@ -199,7 +214,7 @@ def write_device_shards_with_sha256(
         shard_size_bytes=shard_size_bytes,
         max_workers=max_workers,
         relative_to=relative_to,
-        hash_name="sha256",
+        hash_name="blake3",
     )
 
 
@@ -230,6 +245,8 @@ def _write_device_shards(
 
     placements: list[Optional[Tuple[str, int]]] = [None] * len(extents)
     shard_digests: list[Optional[Tuple[str, str]]] = [None] * len(groups)
+    worker_count = min(max_workers, max(1, len(groups)))
+    hash_threads = blake3_threads_per_shard(worker_count)
 
     def write_shard(shard_index: int, indices: list[int]) -> None:
         path = os.path.join(
@@ -240,7 +257,12 @@ def _write_device_shards(
         if hash_name is None:
             writer = DeviceToFileWriter(path, device=device)
         else:
-            writer = DeviceToFileWriter(path, device=device, hash_name=hash_name)
+            writer = DeviceToFileWriter(
+                path,
+                device=device,
+                hash_name=hash_name,
+                hash_threads=hash_threads,
+            )
         with writer:
             for index in indices:
                 va, size = extents[index]
@@ -249,7 +271,7 @@ def _write_device_shards(
         if hash_name is not None:
             shard_digests[shard_index] = (manifest_path, writer.hexdigest())
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = [
             executor.submit(write_shard, shard_index, indices)
             for shard_index, indices in groups.items()
