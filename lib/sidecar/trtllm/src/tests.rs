@@ -116,9 +116,19 @@ impl pb::inference_server::Inference for FakeTrtllm {
         if self.hang_before_stream.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
+        // The fake always samples 42. Like TensorRT-LLM, it stops on a stop
+        // word and returns it only under `include_stop_in_output`.
+        let stopping = request.stopping.clone().unwrap_or_default();
+        let stops_on_42 = stopping.conditions.iter().any(|condition| {
+            condition.condition == Some(pb::stop_condition::Condition::StopTokenId(42))
+        });
+        let returns_42 = !stops_on_42 || stopping.include_stop_in_output == Some(true);
+        let matched_stop = if stops_on_42 { 42 } else { 2 };
 
         let stream = async_stream::try_stream! {
-            let tokens = if wants_logprobs {
+            let tokens = if !returns_42 {
+                Vec::new()
+            } else if wants_logprobs {
                 vec![pb::TokenInfo {
                     token_id: 42,
                     token: String::new(),
@@ -178,7 +188,7 @@ impl pb::inference_server::Inference for FakeTrtllm {
                     reason: pb::FinishReason::Stop as i32,
                     message: String::new(),
                     stop_match: Some(pb::StopMatch {
-                        r#match: Some(pb::stop_match::Match::StopTokenId(2)),
+                        r#match: Some(pb::stop_match::Match::StopTokenId(matched_stop)),
                     }),
                 })),
                 usage: Some(pb::Usage {

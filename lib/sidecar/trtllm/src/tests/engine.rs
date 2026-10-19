@@ -236,28 +236,35 @@ async fn unsupported_features_fail_before_rpc_submission() {
 }
 
 #[tokio::test]
-async fn visible_stop_tokens_are_dispatched_with_stop_retention() {
+async fn visible_stop_token_is_returned_and_hidden_stop_token_is_not() {
     let server = FakeServer::start(FakeTrtllm::default()).await;
     let engine = engine(&server.endpoint, 1);
     engine.start(0).await.expect("start");
+    let token_ids = |outputs: &[dynamo_backend_common::LLMEngineOutput]| {
+        outputs
+            .iter()
+            .flat_map(|output| output.token_ids.clone())
+            .collect::<Vec<_>>()
+    };
 
-    // Once rejected before dispatch; now the stop token (the fake always
-    // streams 42) passes through to the frontend decoder.
-    let mut req = request();
-    req.stop_conditions.stop_token_ids_visible = Some(vec![42]);
-    let outputs = collect(&engine, req).await;
-    assert_eq!(outputs[0].token_ids, [42]);
+    let mut visible = request();
+    visible.stop_conditions.stop_token_ids_visible = Some(vec![42]);
+    let outputs = collect(&engine, visible).await;
+    assert_eq!(token_ids(&outputs), [42]);
     assert_eq!(
-        outputs.last().unwrap().finish_reason,
-        Some(FinishReason::Stop)
+        outputs.last().unwrap().stop_reason,
+        Some(StopReason::Int(42))
     );
 
-    let requests = server.service.requests.lock().await;
-    let stopping = requests[0].stopping.as_ref().expect("stopping");
-    assert_eq!(stopping.include_stop_in_output, Some(true));
-    assert!(stopping.conditions.iter().any(
-        |condition| condition.condition == Some(pb::stop_condition::Condition::StopTokenId(42))
-    ));
+    // Retaining a visible stop makes the engine return hidden stops too.
+    let mut hidden = request();
+    hidden.stop_conditions.stop_token_ids_hidden = Some(vec![42]);
+    hidden.stop_conditions.stop_token_ids_visible = Some(vec![7]);
+    let outputs = collect(&engine, hidden).await;
+    assert!(token_ids(&outputs).is_empty());
+    let terminal = outputs.last().unwrap();
+    assert_eq!(terminal.finish_reason, Some(FinishReason::Stop));
+    assert_eq!(terminal.stop_reason, Some(StopReason::Int(42)));
 }
 
 #[tokio::test]
