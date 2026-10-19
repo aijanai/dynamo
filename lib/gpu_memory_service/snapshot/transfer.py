@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -207,7 +206,7 @@ def file_integrity_for_sources(
         raise RuntimeError(
             f"Invalid file byte count in transfer source integrity metadata: {file_path}"
         )
-    if file_hash_name not in {"blake3", "sha256"}:
+    if file_hash_name != "blake3":
         raise RuntimeError(
             f"Unsupported hash in transfer source integrity metadata: {file_path}"
         )
@@ -215,8 +214,7 @@ def file_integrity_for_sources(
         character not in "0123456789abcdef" for character in file_hash_digest
     ):
         raise RuntimeError(
-            f"Invalid {_hash_label(file_hash_name)} in transfer source integrity "
-            f"metadata: {file_path}"
+            f"Invalid BLAKE3 in transfer source integrity " f"metadata: {file_path}"
         )
 
     expected_offset = 0
@@ -240,13 +238,7 @@ def new_file_hasher(hash_name: str, *, blake3_threads: int) -> Any:
     """Create a supported whole-file hasher for a transfer path."""
     if hash_name == "blake3":
         return blake3(max_threads=blake3_threads)
-    if hash_name == "sha256":
-        return hashlib.sha256()
     raise ValueError(f"unsupported file hash {hash_name!r}")
-
-
-def _hash_label(hash_name: str) -> str:
-    return "BLAKE3" if hash_name == "blake3" else "SHA-256"
 
 
 def verify_file_source_digests(
@@ -282,9 +274,7 @@ def verify_file_source_digests(
                 f"GMS V1 shard length does not match record: {file_path}"
             )
         if digest.hexdigest() != expected_digest:
-            raise RuntimeError(
-                f"GMS V1 shard {_hash_label(hash_name)} mismatch: {file_path}"
-            )
+            raise RuntimeError(f"GMS V1 shard BLAKE3 mismatch: {file_path}")
         return byte_count
 
     verified_bytes = 0

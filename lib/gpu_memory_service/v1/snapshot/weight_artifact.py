@@ -45,7 +45,7 @@ from gpu_memory_service.v1.protocol import (
 
 logger = logging.getLogger(__name__)
 
-_MANIFEST_VERSION = 3
+_MANIFEST_VERSION = 2
 _MANIFEST_NAME = "manifest.json"
 _SHARDS_DIR = "shards"
 
@@ -106,22 +106,6 @@ class WeightArtifactManifest(msgspec.Struct, frozen=True, forbid_unknown_fields=
     shards: tuple[WeightArtifactShard, ...]
 
 
-class _SHA256WeightArtifactShard(
-    msgspec.Struct, frozen=True, forbid_unknown_fields=True
-):
-    path: str
-    byte_count: int
-    sha256: str
-
-
-class _SHA256WeightArtifactManifest(
-    msgspec.Struct, frozen=True, forbid_unknown_fields=True
-):
-    version: int
-    allocations: tuple[WeightArtifactAllocation, ...]
-    shards: tuple[_SHA256WeightArtifactShard, ...]
-
-
 class _ManifestHeader(msgspec.Struct):
     version: int
 
@@ -131,14 +115,6 @@ class _LegacyWeightArtifactManifest(
 ):
     version: int
     allocations: tuple[WeightArtifactAllocation, ...]
-
-
-def _shard_digest(
-    shard: WeightArtifactShard | _SHA256WeightArtifactShard,
-) -> str:
-    if isinstance(shard, _SHA256WeightArtifactShard):
-        return shard.sha256
-    return shard.blake3
 
 
 def save_weights(
@@ -396,10 +372,7 @@ def _load_manifest(
     granularity: int,
     sharded_ssd_roots: Sequence[str] | None = None,
 ) -> tuple[
-    WeightArtifactManifest
-    | _SHA256WeightArtifactManifest
-    | _LegacyWeightArtifactManifest,
-    list[FileTransferSource],
+    WeightArtifactManifest | _LegacyWeightArtifactManifest, list[FileTransferSource]
 ]:
     if granularity <= 0:
         raise ValueError("allocation granularity must be positive")
@@ -407,17 +380,13 @@ def _load_manifest(
     allowed_roots = tuple(Path(path) for path in _normalize_roots(sharded_ssd_roots))
     manifest_bytes = (root / _MANIFEST_NAME).read_bytes()
     header = msgspec.json.decode(manifest_bytes, type=_ManifestHeader, strict=True)
-    if header.version not in (1, 2, _MANIFEST_VERSION):
+    if header.version not in (1, _MANIFEST_VERSION):
         raise RuntimeError(
             f"unsupported GMS V1 weight artifact version {header.version}; "
-            f"expected 1, 2, or {_MANIFEST_VERSION}"
+            f"expected 1 or {_MANIFEST_VERSION}"
         )
     manifest_type = (
-        _LegacyWeightArtifactManifest
-        if header.version == 1
-        else _SHA256WeightArtifactManifest
-        if header.version == 2
-        else WeightArtifactManifest
+        _LegacyWeightArtifactManifest if header.version == 1 else WeightArtifactManifest
     )
     manifest = msgspec.json.decode(
         manifest_bytes,
@@ -427,11 +396,10 @@ def _load_manifest(
     if not manifest.allocations:
         raise RuntimeError("GMS V1 weight artifact has no allocations")
     shards = manifest.shards if header.version != 1 else ()
-    if header.version in (2, _MANIFEST_VERSION) and not shards:
+    if header.version == _MANIFEST_VERSION and not shards:
         raise RuntimeError("GMS V1 weight artifact has no shard integrity records")
 
-    hash_name = "sha256" if header.version == 2 else "blake3"
-    shard_records: dict[str, WeightArtifactShard | _SHA256WeightArtifactShard] = {}
+    shard_records: dict[str, WeightArtifactShard] = {}
     for shard in shards:
         if not shard.path.strip():
             raise RuntimeError("GMS V1 weight artifact has an empty shard path")
@@ -439,11 +407,9 @@ def _load_manifest(
             raise RuntimeError(f"duplicate GMS V1 shard record {shard.path!r}")
         if shard.byte_count <= 0:
             raise RuntimeError(f"GMS V1 shard {shard.path!r} has invalid size")
-        digest = _shard_digest(shard)
-        if not _is_digest(digest):
-            label = "SHA-256" if hash_name == "sha256" else "BLAKE3"
+        if not _is_digest(shard.blake3):
             raise RuntimeError(
-                f"GMS V1 shard {shard.path!r} has an invalid {label} digest"
+                f"GMS V1 shard {shard.path!r} has an invalid BLAKE3 digest"
             )
         shard_records[shard.path] = shard
 
@@ -477,8 +443,8 @@ def _load_manifest(
                 file_byte_count=shard_records[allocation.shard].byte_count
                 if allocation.shard in shard_records
                 else None,
-                file_hash_name=hash_name if allocation.shard in shard_records else None,
-                file_hash_digest=_shard_digest(shard_records[allocation.shard])
+                file_hash_name="blake3" if allocation.shard in shard_records else None,
+                file_hash_digest=shard_records[allocation.shard].blake3
                 if allocation.shard in shard_records
                 else None,
             )

@@ -457,8 +457,7 @@ def restore_file_groups_with_nixl_staging(
                 os.close(fd)
             if digest is not None:
                 if digest.hexdigest() != expected_digest:
-                    label = "BLAKE3" if hash_name == "blake3" else "SHA-256"
-                    raise RuntimeError(f"GMS V1 shard {label} mismatch: {file_path}")
+                    raise RuntimeError(f"GMS V1 shard BLAKE3 mismatch: {file_path}")
                 verified_files += 1
                 verified_bytes += integrity[0]
 

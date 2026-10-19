@@ -3,7 +3,6 @@
 
 """Unit tests for NIXL/POSIX staging restore planning."""
 
-import hashlib
 import threading
 
 import pytest
@@ -221,20 +220,6 @@ def test_staging_restore_hashes_the_exact_transferred_bytes(monkeypatch):
         monkeypatch,
         data,
         blake3(data).hexdigest(),
-    )
-
-    assert transferred == len(data)
-    assert copies == [(100, b"abcd"), (200, b"efgh")]
-
-
-def test_staging_restore_preserves_schema_v2_sha256_verification(monkeypatch):
-    data = b"abcdefgh"
-
-    transferred, copies = _restore_staged_bytes(
-        monkeypatch,
-        data,
-        hashlib.sha256(data).hexdigest(),
-        hash_name="sha256",
     )
 
     assert transferred == len(data)

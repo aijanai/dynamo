@@ -111,53 +111,47 @@ rank-local socket is the control-plane trust boundary.
 
 ## Cold weight storage
 
-The checkpoint saver with `DYN_GMS_USE_V1=true` connects RO to the rank-local `weights`
-socket, enumerates the committed allocation IDs and aligned sizes, temporarily
-imports them, and writes raw shard bytes through the shared snapshot disk writer.
-The weight-artifact schema is versioned independently from the GMS protocol. Its
-manifest contains each allocation's exact ID, aligned size, shard path, and
-shard offset, plus the size and BLAKE3 digest of every physical shard. The
-digest is calculated while the device bytes are staged through host memory, so
-save does not reread the shard.
+GMS saves weight bytes before Snapshot captures the sleeping engine. If a shard
+changes on disk without changing size, a size check alone cannot detect it.
+New checkpoints record a cryptographic checksum (digest) for each shard and
+check the bytes during restore. A mismatch stops the restore before the
+restored worker can use those weights.
 
-New checkpoints use schema version 3. During restore, the transfer backend
-compares each shard with the BLAKE3 digest saved at capture time. This detects
-corruption even when the file size is unchanged.
+| Weight-artifact version | Integrity check | Restore behavior |
+| --- | --- | --- |
+| 2 (new checkpoints) | BLAKE3 for each shard | Rejects missing, truncated, or changed shards, including same-size changes. |
+| 1 (legacy checkpoints) | No content digest | Still loads after structural checks, with a warning that same-size corruption cannot be detected. |
 
-Schema-version-2 checkpoints produced by the earlier SHA-256 implementation
-remain loadable and retain their SHA-256 verification. Schema-version-1
-checkpoints also remain loadable. The loader still checks their allocation IDs,
-paths, sizes, and extents, but version 1 cannot detect same-length content
-changes. Each version-1 load warns that content-digest verification is
-unavailable. Recapture with the current saver to add a digest; hashing an old
-file at load time cannot establish its original contents.
+The weight-artifact version is independent of the GMS protocol version.
+Recapture a version-1 checkpoint with the current saver to add digests: hashing
+an old shard now cannot prove what it contained when it was captured.
 
-Without `--sharded-ssd-roots`, shard paths remain relative to the device
-artifact directory. With sharded roots, files are distributed across the
-per-device roots using the existing V0 directory convention and the manifest
-records their absolute paths.
+With `DYN_GMS_USE_V1=true`, the saver reads committed allocation IDs and sizes
+from the rank-local `weights` socket, temporarily imports the allocations, and
+writes raw shards through the shared snapshot disk writer. It hashes bytes as
+they pass through host memory, without rereading the saved files. The manifest
+records each allocation's ID, aligned size, shard path, and offset, plus the
+size and digest of every shard. By default, paths are relative to the device
+artifact directory. `--sharded-ssd-roots` distributes files across per-device
+roots using the V0 layout and records absolute paths.
 
-On restore, the checkpoint loader with `DYN_GMS_USE_V1=true` reads the manifest,
-validates its paths and layout, and builds `FileTransferSource` records carrying
-the expected whole-shard size and digest. Missing or invalid schema-version-2
-or schema-version-3 digests fail the load; they never fall back to legacy
-loading. The loader then
-creates a transfer backend, connects RW to a fresh `weights` socket, recreates
-the exact IDs and sizes, and builds `GMSTransferTarget` records. Backend
-selection goes through
-`snapshot.transfer.create_transfer_backend`; `nixl`, `nixl-gds`, and
-`sharded-ssd` use the same implementations and configuration as V0.
+On restore, the loader validates the manifest and shard layout, including the
+required digests for version 2. Missing or invalid digests fail the load;
+they do not silently fall back to version-1 behavior. The loader then opens a
+fresh RW `weights` session with the saved allocation IDs and sizes and
+transfers the shards. Backend selection still uses
+`snapshot.transfer.create_transfer_backend` and the existing V0 configuration:
 
-The `nixl` and `sharded-ssd` backends calculate the recorded digest over the
-exact bytes already passing through their pinned host staging buffers (BLAKE3
-for version 3 and SHA-256 for version 2), so integrity does not add another
-storage read. A mismatch aborts the fresh GMS session before it is committed.
-The direct `nixl-gds` path has no CPU-visible staging buffer, so it explicitly
-verifies each shard with a separate pre-transfer read. Keep GDS checkpoint
-files unchanged through verification and transfer. The loader then
-synchronizes, releases its temporary mappings, commits the same socket RW to
-RO, closes its lease, and exits. The server retains the committed backing while
-the restored worker acquires a new RO lease and remaps its preserved VAs.
+| Transfer backend | How it verifies the recorded digest |
+| --- | --- |
+| `nixl` and `sharded-ssd` | Hash the same bytes being copied through pinned host memory, with no extra storage read. |
+| `nixl-gds` | Read and verify each shard before direct transfer, because GDS has no CPU-visible staging buffer. Keep files unchanged between verification and transfer. |
+
+BLAKE3 is used on each applicable backend. After all transfers and checks
+succeed, the loader synchronizes, releases its temporary mappings, commits the
+socket from RW to RO, and exits.
+The server keeps the committed backing while the restored worker reconnects
+RO and remaps the preserved virtual addresses.
 
 ## Weight construction
 
