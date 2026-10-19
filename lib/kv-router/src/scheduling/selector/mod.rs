@@ -235,7 +235,7 @@ fn cache_snapshot(request: &SchedulingRequest) -> CacheSnapshot<'_> {
 /// Build one worker's input row. Worker selection and request classification share this
 /// builder, so each input group carries the same values in both.
 #[inline(always)]
-fn worker_input_row(
+pub(crate) fn worker_input_row(
     request: &SchedulingRequest,
     worker: WorkerWithDpRank,
     preferred_taint_multiplier: Option<f64>,
