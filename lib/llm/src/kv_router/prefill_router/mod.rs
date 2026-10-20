@@ -28,6 +28,7 @@ use futures::stream::{self, StreamExt};
 use crate::{
     discovery::{ModelManager, WorkerSetTarget, WorkerSetTargetId},
     kv_router::{RoutingHost, SelectionPolicySource},
+    local_model::runtime_config::DisaggregatedEndpoint,
     protocols::common::{
         extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId},
         llm_backend::{LLMEngineOutput, PreprocessedRequest},
@@ -151,6 +152,23 @@ fn into_decode_request(
     req
 }
 
+/// Bootstrap info for a decode leg dispatched while its prefill still runs.
+/// `None` when the prefill worker published no host and port.
+fn bootstrap_info_from_endpoint(
+    endpoint: DisaggregatedEndpoint,
+    dp_rank: Option<u32>,
+    dp_size: Option<u32>,
+    random_room: u64,
+) -> Option<BootstrapInfo> {
+    Some(BootstrapInfo {
+        bootstrap_host: endpoint.bootstrap_host?,
+        bootstrap_port: endpoint.bootstrap_port?,
+        bootstrap_room: compute_bootstrap_room(dp_rank, dp_size, random_room),
+        handoff_id: Some(Uuid::new_v4()),
+        kv_transfer_params: endpoint.kv_transfer_params,
+    })
+}
+
 fn extract_bootstrap_info(params: &serde_json::Value) -> Option<BootstrapInfo> {
     let bootstrap_host = params.get("bootstrap_host")?.as_str()?.to_string();
     let bootstrap_port = u16::try_from(params.get("bootstrap_port")?.as_u64()?).ok()?;
@@ -160,6 +178,7 @@ fn extract_bootstrap_info(params: &serde_json::Value) -> Option<BootstrapInfo> {
         bootstrap_port,
         bootstrap_room,
         handoff_id: Some(Uuid::new_v4()),
+        kv_transfer_params: None,
     })
 }
 
@@ -679,21 +698,12 @@ impl PrefillRouter {
         let bootstrap_info = self
             .model_manager
             .get_disaggregated_endpoint(endpoint_id, worker_id)
-            .map(|endpoint| (endpoint_id, endpoint))
-            .and_then(|(endpoint_id, endpoint)| {
-                let host = endpoint.bootstrap_host?;
-                let port = endpoint.bootstrap_port?;
+            .and_then(|endpoint| {
                 let dp_size = self
                     .model_manager
                     .get_data_parallel_size(endpoint_id, worker_id);
                 let random_room = rand::random_range(0..=i64::MAX.cast_unsigned());
-                let bootstrap_room = compute_bootstrap_room(dp_rank, dp_size, random_room);
-                Some(BootstrapInfo {
-                    bootstrap_host: host,
-                    bootstrap_port: port,
-                    bootstrap_room,
-                    handoff_id: Some(Uuid::new_v4()),
-                })
+                bootstrap_info_from_endpoint(endpoint, dp_rank, dp_size, random_room)
             });
         let routing = request.routing_mut();
         routing.prefill_worker_id = Some(worker_id);
@@ -934,6 +944,7 @@ mod tests {
                 bootstrap_port: 4242,
                 bootstrap_room: 7,
                 handoff_id: None,
+                kv_transfer_params: None,
             },
             worker_id: 11,
             prefill_dp_rank: Some(3),
@@ -1126,6 +1137,39 @@ mod tests {
         assert_eq!(override_config.assume_kv_reuse, Some(false));
         assert_eq!(override_config.track_prefill_tokens, Some(false));
         assert_eq!(override_config.router_temperature, Some(0.7));
+    }
+
+    #[test]
+    fn bootstrap_info_from_endpoint_carries_published_kv_transfer_params() {
+        let params = serde_json::json!({"engine_id": "eng-p", "tp_size": 1});
+        let endpoint = DisaggregatedEndpoint {
+            bootstrap_host: Some("prefill-0".to_string()),
+            bootstrap_port: Some(5600),
+            kv_transfer_params: Some(params.clone()),
+        };
+        let info = bootstrap_info_from_endpoint(endpoint, Some(1), Some(4), 12345).unwrap();
+        assert_eq!(info.bootstrap_host, "prefill-0");
+        assert_eq!(info.bootstrap_port, 5600);
+        assert_eq!(
+            info.bootstrap_room,
+            compute_bootstrap_room(Some(1), Some(4), 12345)
+        );
+        assert!(info.handoff_id.is_some());
+        assert_eq!(info.kv_transfer_params, Some(params));
+    }
+
+    #[test]
+    fn bootstrap_info_from_endpoint_needs_host_and_port() {
+        let no_port = DisaggregatedEndpoint {
+            bootstrap_host: Some("prefill-0".to_string()),
+            ..Default::default()
+        };
+        assert!(bootstrap_info_from_endpoint(no_port, None, None, 1).is_none());
+        let no_host = DisaggregatedEndpoint {
+            bootstrap_port: Some(5600),
+            ..Default::default()
+        };
+        assert!(bootstrap_info_from_endpoint(no_host, None, None, 1).is_none());
     }
 
     #[test]

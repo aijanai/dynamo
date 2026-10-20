@@ -108,6 +108,11 @@ pub struct BootstrapInfo {
     /// validated by the bootstrap registration and framing protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_id: Option<Uuid>,
+
+    /// Copied from the prefill worker's `DisaggregatedEndpoint`, for backends
+    /// whose decode side needs more than host and port to reach the prefill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_transfer_params: Option<serde_json::Value>,
 }
 
 /// Directional pointer to a predecessor worker's `engine.generate` span.
@@ -1163,6 +1168,37 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_info_kv_transfer_params_is_optional_on_the_wire() {
+        let mut info = BootstrapInfo {
+            bootstrap_host: "127.0.0.1".to_string(),
+            bootstrap_port: 1234,
+            bootstrap_room: 7,
+            handoff_id: None,
+            kv_transfer_params: None,
+        };
+        // Absent when unset, so existing backends see the same payload.
+        let value = serde_json::to_value(&info).unwrap();
+        assert!(value.get("kv_transfer_params").is_none());
+        assert!(
+            serde_json::from_value::<BootstrapInfo>(value)
+                .unwrap()
+                .kv_transfer_params
+                .is_none()
+        );
+
+        let params = serde_json::json!({"engine_id": "eng-p", "tp_size": 2});
+        info.kv_transfer_params = Some(params.clone());
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(value["kv_transfer_params"], params);
+        assert_eq!(
+            serde_json::from_value::<BootstrapInfo>(value)
+                .unwrap()
+                .kv_transfer_params,
+            Some(params)
+        );
+    }
+
+    #[test]
     fn bootstrap_info_carries_only_stable_handoff_identity() {
         let handoff_id = Uuid::from_u128(42);
         let info = BootstrapInfo {
@@ -1170,6 +1206,7 @@ mod tests {
             bootstrap_port: 1234,
             bootstrap_room: 7,
             handoff_id: Some(handoff_id),
+            kv_transfer_params: None,
         };
 
         let value = serde_json::to_value(&info).unwrap();

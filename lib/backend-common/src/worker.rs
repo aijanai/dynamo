@@ -2172,6 +2172,7 @@ async fn build_local_model(
             Some(DisaggregatedEndpoint {
                 bootstrap_host: Some(host.clone()),
                 bootstrap_port: Some(port),
+                kv_transfer_params: None,
             })
         }
         _ => None,

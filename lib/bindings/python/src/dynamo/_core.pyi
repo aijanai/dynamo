@@ -913,6 +913,7 @@ class ModelRuntimeConfig:
     kv_transfer_preferred_weight: float | None
     bootstrap_host: str | None
     bootstrap_port: int | None
+    kv_transfer_params: str | None
 
     def __init__(self) -> None: ...
 
@@ -932,8 +933,14 @@ class ModelRuntimeConfig:
             self,
             bootstrap_host: str | None = None,
             bootstrap_port: int | None = None,
+            kv_transfer_params: str | None = None,
         ) -> None:
-        """Set the disaggregated endpoint for the model"""
+        """Set the disaggregated endpoint for the model.
+
+        ``kv_transfer_params`` is JSON text copied verbatim into the decode
+        leg's ``bootstrap_info``, for backends that need more than host and
+        port to reach the prefill worker before it responds.
+        """
         ...
 
 class RoutingConstraints:

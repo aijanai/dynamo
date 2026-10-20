@@ -39,6 +39,7 @@ fn request_maps_native_fields_and_full_width_room() {
         bootstrap_port: 5000,
         bootstrap_room: i64::MAX as u64,
         handoff_id: None,
+        kv_transfer_params: None,
     });
     let mapped =
         build_generate_request(&request, "rid-1", DisaggregationMode::Decode, None, None).unwrap();
@@ -184,6 +185,7 @@ fn room_above_signed_int64_is_rejected() {
         bootstrap_port: 5000,
         bootstrap_room: i64::MAX as u64 + 1,
         handoff_id: None,
+        kv_transfer_params: None,
     });
     assert!(
         build_generate_request(&request, "rid-4", DisaggregationMode::Decode, None, None,).is_err()
@@ -697,6 +699,7 @@ fn bootstrap_info_precedes_prefill_result_and_aggregated_ignores_both() {
         bootstrap_port: 5000,
         bootstrap_room: 23,
         handoff_id: None,
+        kv_transfer_params: None,
     });
     request.prefill_result = Some(PrefillResult {
         disaggregated_params: json!({"bootstrap_host": "other-prefill", "bootstrap_port": 5001, "bootstrap_room": 24}),

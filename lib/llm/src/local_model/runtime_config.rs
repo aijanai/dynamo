@@ -240,6 +240,11 @@ pub struct DisaggregatedEndpoint {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootstrap_port: Option<u16>,
+
+    /// Backend-specific KV transfer coordinates the decode worker needs before
+    /// the prefill responds (e.g. a vLLM NIXL engine id). Opaque to the router.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_transfer_params: Option<serde_json::Value>,
 }
 
 /// Controls how historical `function.arguments` are serialized before being

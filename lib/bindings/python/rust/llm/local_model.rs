@@ -322,16 +322,33 @@ impl ModelRuntimeConfig {
         Ok(())
     }
 
-    #[pyo3(signature = (bootstrap_host=None, bootstrap_port=None))]
+    #[pyo3(signature = (bootstrap_host=None, bootstrap_port=None, kv_transfer_params=None))]
     fn set_disaggregated_endpoint(
         &mut self,
         bootstrap_host: Option<String>,
         bootstrap_port: Option<u16>,
-    ) {
+        kv_transfer_params: Option<String>,
+    ) -> PyResult<()> {
+        // JSON text, like set_engine_specific: the router copies it verbatim.
+        let kv_transfer_params = kv_transfer_params
+            .map(|text| serde_json::from_str::<serde_json::Value>(&text))
+            .transpose()
+            .map_err(to_pyerr)?;
         self.inner.disaggregated_endpoint = Some(RsDisaggregatedEndpoint {
             bootstrap_host,
             bootstrap_port,
+            kv_transfer_params,
         });
+        Ok(())
+    }
+
+    #[getter]
+    fn kv_transfer_params(&self) -> Option<String> {
+        self.inner
+            .disaggregated_endpoint
+            .as_ref()
+            .and_then(|e| e.kv_transfer_params.as_ref())
+            .map(|v| v.to_string())
     }
 
     #[getter]

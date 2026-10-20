@@ -25,6 +25,7 @@ from dynamo.vllm.kv_connector_protocols import (
     LMCacheMPConnectorProtocol,
     MooncakeConnectorProtocol,
     NixlConnectorProtocol,
+    NixlPushConnectorProtocol,
     make_kv_connector_protocol,
 )
 
@@ -530,6 +531,7 @@ def test_registry_keys_match_vllm_connector_names():
     vLLM uses in ``KVTransferConfig.kv_connector``."""
     assert set(KV_CONNECTOR_PROTOCOLS) == {
         "NixlConnector",
+        "NixlPushConnector",
         "MooncakeConnector",
         "LMCacheMPConnector",
         "NeuronNixlConnector",
@@ -578,3 +580,133 @@ def test_real_vllm_mooncake_helper_signature_is_compatible():
         f"get_mooncake_bootstrap_addr signature changed: expected at least 1 "
         f"positional arg, got {sig}"
     )
+
+
+# --- NixlPushConnector: early (concurrent) decode dispatch -----------------
+
+
+def _push_config(tp=1, dcp=1, pp=1, dp=1, engine_id="eng-p") -> SimpleNamespace:
+    return SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="NixlPushConnector", engine_id=engine_id
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tp,
+            decode_context_parallel_size=dcp,
+            pipeline_parallel_size=pp,
+            data_parallel_size=dp,
+        ),
+    )
+
+
+def test_make_kv_connector_protocol_dispatches_nixl_push():
+    proto = make_kv_connector_protocol(_push_config())
+    assert type(proto) is NixlPushConnectorProtocol
+
+
+def test_nixl_push_prefill_and_sequential_decode_match_pull():
+    # Without an early dispatch the push connector speaks NIXL pull's shape.
+    pull = NixlConnectorProtocol(_push_config())
+    push = NixlPushConnectorProtocol(_push_config())
+    assert (
+        push.prefill_request_kv_transfer_params()
+        == pull.prefill_request_kv_transfer_params()
+    )
+    resp = SimpleNamespace(kv_transfer_params={"do_remote_prefill": True})
+    assert push.decode_request_kv_transfer_params(resp) is resp.kv_transfer_params
+
+
+def test_nixl_push_publishes_side_channel_and_engine(monkeypatch):
+    monkeypatch.setenv("VLLM_NIXL_SIDE_CHANNEL_HOST", "10.0.0.7")
+    monkeypatch.setenv("VLLM_NIXL_SIDE_CHANNEL_PORT", "5700")
+    host, port, params = NixlPushConnectorProtocol(
+        _push_config(tp=2, pp=1, dp=1)
+    ).disaggregated_endpoint()
+    assert (host, port) == ("10.0.0.7", 5700)
+    assert params == {
+        "engine_id": "eng-p",
+        "tp_size": 2,
+        "dcp_size": 1,
+        "pp_size": 1,
+        "dp_size": 1,
+    }
+
+
+def test_nixl_pull_publishes_no_endpoint():
+    # Pull needs the prefill's block ids, so decode cannot start early.
+    assert NixlConnectorProtocol(_push_config()).disaggregated_endpoint() is None
+
+
+def _bootstrap(params, host="10.0.0.7", port=5700) -> dict:
+    return {
+        "bootstrap_host": host,
+        "bootstrap_port": port,
+        "bootstrap_room": 42,
+        "kv_transfer_params": params,
+    }
+
+
+def test_nixl_push_decode_params_from_bootstrap():
+    published = {"engine_id": "eng-p", "tp_size": 2, "pp_size": 1, "dp_size": 1}
+    kv = NixlPushConnectorProtocol(
+        _push_config()
+    ).decode_request_kv_transfer_params_from_bootstrap(
+        _bootstrap(published), prefill_dp_rank=None
+    )
+    assert kv == {
+        "do_remote_prefill": True,
+        "do_remote_decode": False,
+        "remote_engine_id": "eng-p",
+        "remote_host": "10.0.0.7",
+        "remote_port": 5700,
+        "tp_size": 2,
+        "dcp_size": 1,
+        "pp_size": 1,
+    }
+
+
+def test_nixl_push_decode_params_apply_prefill_dp_rank():
+    published = {"engine_id": "eng-p", "tp_size": 1, "dp_size": 4}
+    kv = NixlPushConnectorProtocol(
+        _push_config()
+    ).decode_request_kv_transfer_params_from_bootstrap(
+        _bootstrap(published), prefill_dp_rank=2
+    )
+    # vLLM's EngineCore suffixes the engine id and offsets the side channel.
+    assert kv["remote_engine_id"] == "eng-p_dp2"
+    assert kv["remote_port"] == 5702
+
+
+def test_nixl_push_decode_needs_dp_rank_with_prefill_dp():
+    published = {"engine_id": "eng-p", "tp_size": 1, "dp_size": 4}
+    with pytest.raises(ValueError, match="DP rank"):
+        NixlPushConnectorProtocol(
+            _push_config()
+        ).decode_request_kv_transfer_params_from_bootstrap(
+            _bootstrap(published), prefill_dp_rank=None
+        )
+
+
+def test_nixl_push_ignores_bootstrap_without_published_engine():
+    # An endpoint published by another backend (e.g. SGLang) has no engine id.
+    proto = NixlPushConnectorProtocol(_push_config())
+    assert (
+        proto.decode_request_kv_transfer_params_from_bootstrap(
+            _bootstrap(None), prefill_dp_rank=None
+        )
+        is None
+    )
+
+
+def test_other_protocols_do_not_support_early_dispatch(fake_mooncake):
+    for proto in (
+        NixlConnectorProtocol(_push_config()),
+        LMCacheMPConnectorProtocol(_push_config()),
+    ):
+        assert proto.disaggregated_endpoint() is None
+        assert (
+            proto.decode_request_kv_transfer_params_from_bootstrap(
+                _bootstrap({"engine_id": "x", "tp_size": 1}), prefill_dp_rank=None
+            )
+            is None
+        )

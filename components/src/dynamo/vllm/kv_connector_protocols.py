@@ -17,6 +17,7 @@ entry.
 from __future__ import annotations
 
 import copy
+import os
 import uuid
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, Tuple, Type
@@ -43,6 +44,21 @@ class KvConnectorProtocol(ABC):
         """``kv_transfer_params`` for the decode worker, derived from the
         prefill response. Return ``None`` if the protocol doesn't produce
         one."""
+
+    def disaggregated_endpoint(
+        self,
+    ) -> Optional[Tuple[str, int, Dict[str, Any]]]:
+        """``(host, port, kv_transfer_params)`` a prefill worker publishes so
+        the router can dispatch the decode leg before the prefill responds.
+        ``None`` keeps the sequential path (decode waits for the prefill)."""
+        return None
+
+    def decode_request_kv_transfer_params_from_bootstrap(
+        self, bootstrap_info: Dict[str, Any], prefill_dp_rank: Optional[int]
+    ) -> Optional[Dict[str, Any]]:
+        """``kv_transfer_params`` for a decode leg dispatched concurrently
+        with its prefill, built from the router's ``bootstrap_info``."""
+        return None
 
 
 class NixlConnectorProtocol(KvConnectorProtocol):
@@ -112,6 +128,65 @@ class MooncakeConnectorProtocol(KvConnectorProtocol):
         }
 
 
+class NixlPushConnectorProtocol(NixlConnectorProtocol):
+    """Push-based NIXL: prefill WRITEs into blocks the decode worker
+    registers with it. The prefill publishes its side channel and engine id,
+    so the decode leg can be dispatched concurrently and register while the
+    prefill is still running instead of after it responds."""
+
+    def disaggregated_endpoint(
+        self,
+    ) -> Optional[Tuple[str, int, Dict[str, Any]]]:
+        kv_cfg = self._vllm_config.kv_transfer_config
+        parallel = self._vllm_config.parallel_config
+        # Same values vLLM's push scheduler puts in the prefill response,
+        # taken before EngineCore appends its DP rank (see the decode side).
+        host = os.environ.get("VLLM_NIXL_SIDE_CHANNEL_HOST", "localhost")
+        port = int(os.environ.get("VLLM_NIXL_SIDE_CHANNEL_PORT", "5600"))
+        params = {
+            "engine_id": kv_cfg.engine_id,
+            "tp_size": max(
+                parallel.tensor_parallel_size,
+                parallel.decode_context_parallel_size,
+            ),
+            "dcp_size": parallel.decode_context_parallel_size,
+            "pp_size": parallel.pipeline_parallel_size,
+            "dp_size": parallel.data_parallel_size,
+        }
+        return host, port, params
+
+    def decode_request_kv_transfer_params_from_bootstrap(
+        self, bootstrap_info: Dict[str, Any], prefill_dp_rank: Optional[int]
+    ) -> Optional[Dict[str, Any]]:
+        published = bootstrap_info.get("kv_transfer_params")
+        if not published or "engine_id" not in published:
+            return None
+        engine_id = published["engine_id"]
+        port = int(bootstrap_info["bootstrap_port"])
+        # vLLM's EngineCore suffixes the engine id and offsets the side
+        # channel port by the DP rank; the router knows which rank it picked.
+        if int(published.get("dp_size", 1)) > 1:
+            if prefill_dp_rank is None:
+                raise ValueError(
+                    "NixlPushConnector with prefill data parallelism needs the "
+                    "prefill DP rank to reach the right engine."
+                )
+            engine_id = f"{engine_id}_dp{prefill_dp_rank}"
+            port += prefill_dp_rank
+        # No remote_request_id: the prefill's internal id is not known yet,
+        # so vLLM skips lease heartbeats for these requests.
+        return {
+            "do_remote_prefill": True,
+            "do_remote_decode": False,
+            "remote_engine_id": engine_id,
+            "remote_host": bootstrap_info["bootstrap_host"],
+            "remote_port": port,
+            "tp_size": published["tp_size"],
+            "dcp_size": published.get("dcp_size", 1),
+            "pp_size": published.get("pp_size", 1),
+        }
+
+
 class LMCacheMPConnectorProtocol(KvConnectorProtocol):
     """Cache-mediated: prefill saves KV chunks into the shared LMCache MP
     pool; decode retrieves them by token-hash lookup during its own
@@ -134,6 +209,7 @@ class LMCacheMPConnectorProtocol(KvConnectorProtocol):
 # Keyed by ``KVTransferConfig.kv_connector``. One entry per connector.
 KV_CONNECTOR_PROTOCOLS: Dict[str, Type[KvConnectorProtocol]] = {
     "NixlConnector": NixlConnectorProtocol,
+    "NixlPushConnector": NixlPushConnectorProtocol,
     "NeuronNixlConnector": NixlConnectorProtocol,
     "MooncakeConnector": MooncakeConnectorProtocol,
     "LMCacheMPConnector": LMCacheMPConnectorProtocol,

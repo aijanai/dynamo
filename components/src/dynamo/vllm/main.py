@@ -88,6 +88,7 @@ from .headless import run_dynamo_headless
 from .instrumented_scheduler import ENV_FPM_BENCHMARK_OUTPUT_PATH, ENV_FPM_WORKER_ID
 from .kv_connector_protocols import (
     disable_hybrid_kv_cache_manager_for_incompatible_pd_connector,
+    make_kv_connector_protocol,
 )
 from .multimodal_utils.cache_config import configure_multimodal_embedding_cache
 from .multimodal_utils.media_config import create_frontend_media_config
@@ -871,6 +872,31 @@ def setup_vllm_engine(
     )
 
 
+def publish_vllm_disaggregated_endpoint(
+    runtime_config: ModelRuntimeConfig, vllm_config: VllmConfig
+) -> None:
+    """Let the router dispatch decode concurrently with this prefill worker.
+
+    Only connectors whose decode side can start before the prefill responds
+    publish an endpoint; the others keep the sequential handoff.
+    """
+    if vllm_config.kv_transfer_config is None:
+        return
+    endpoint = make_kv_connector_protocol(vllm_config).disaggregated_endpoint()
+    if endpoint is None:
+        return
+    host, port, kv_transfer_params = endpoint
+    runtime_config.set_disaggregated_endpoint(
+        host, port, json.dumps(kv_transfer_params)
+    )
+    logging.info(
+        "Publishing disaggregated endpoint %s:%s with %s",
+        host,
+        port,
+        kv_transfer_params,
+    )
+
+
 async def register_vllm_model(
     model_input: ModelInput,
     model_type: ModelType,
@@ -958,6 +984,8 @@ async def register_vllm_model(
     runtime_config.enable_local_indexer = config.enable_local_indexer
     runtime_config.kv_event_publishing_enabled = config.use_kv_events
     runtime_config.kv_state_endpoint = config.kv_state_endpoint
+    if worker_type == WorkerType.Prefill:
+        publish_vllm_disaggregated_endpoint(runtime_config, vllm_config)
     if state_agent_enabled:
         runtime_config.kv_event_source_mode = "state_agent_v2"
 
