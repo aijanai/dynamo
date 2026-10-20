@@ -27,6 +27,8 @@ var vllmProfileOptions = []vllmProfileOption{
 	{name: "--data-parallel-rank", aliases: []string{"-dpn"}},
 	{name: "--data-parallel-start-rank", aliases: []string{"-dpr"}},
 	{name: "--data-parallel-backend", aliases: []string{"-dpb"}},
+	{name: "--data-parallel-address", aliases: []string{"-dpa"}},
+	{name: "--data-parallel-rpc-port", aliases: []string{"-dpp"}},
 	{name: "--distributed-executor-backend"},
 	{name: "--nnodes", aliases: []string{"-n"}},
 	{name: "--node-rank", aliases: []string{"-r"}},
