@@ -6,6 +6,7 @@
 package dynamo
 
 import (
+	"fmt"
 	"strconv"
 
 	api "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
@@ -14,6 +15,18 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 )
+
+func renderVLLMComponentEngineGroup(dgd *api.DynamoGraphDeployment, component *api.DynamoComponentDeploymentSharedSpec, worldIndex int32) (*api.DynamoGraphDeploymentEngineGroup, error) {
+	// Geometry and supported world count belong to the backend, not the child lifecycle controller.
+	if worldIndex != 0 {
+		return nil, fmt.Errorf("vLLM Engine Group integration supports one world per component")
+	}
+	_, profile, err := ResolveVLLMComponentEngineGroup(component)
+	if err != nil {
+		return nil, err
+	}
+	return RenderVLLMEngineGroup(dgd, component, worldIndex, profile), nil
+}
 
 // RenderVLLMEngineGroup declares one new world and seeds its private launch authority at creation.
 // dgd, component, and component.EngineGroup must not be nil; worldIndex must be nonnegative.

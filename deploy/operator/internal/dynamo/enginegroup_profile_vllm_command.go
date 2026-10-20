@@ -18,6 +18,11 @@ type vllmProfileOption struct {
 }
 
 var vllmProfileOptions = []vllmProfileOption{
+	{name: "--host"},
+	{name: "--port"},
+	{name: "--uds"},
+	{name: "--ssl-keyfile"},
+	{name: "--ssl-certfile"},
 	{name: "--tensor-parallel-size", aliases: []string{"-tp"}},
 	{name: "--pipeline-parallel-size", aliases: []string{"-pp"}},
 	{name: "--decode-context-parallel-size", aliases: []string{"-dcp"}},

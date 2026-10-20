@@ -149,7 +149,32 @@ The next slice must prove bootstrap without a joiner-readiness cycle, shared-wor
 admission at startup and recovery, topology loss during registration, nonblocking
 target submission during drain, and independent engine/sidecar restarts. The
 bootstrap renderer and Grove capacity/launch collaborator are covered by CPU and
-API-server tests, but are not registered as a complete vLLM runtime. DGD selection
-and creation, concrete native process resolution, traffic admission, and
-topology-bound serving verification remain to be wired before deployment is enabled.
+API-server tests. The DGD pathway now resolves the immutable native declaration,
+renders one PCSG with one member clique, seeds the child once, and rolls up
+engine-authoritative readiness without resetting its live scale target.
+
+Shared graph assembly and DGD child reconciliation select a backend without
+interpreting its engine geometry. The vLLM renderer owns native profile validation,
+launch preparation and allocation probes; it reuses the standard Grove Pod
+construction for metadata, secrets, resources and placement. Runtime composition,
+not the capacity adapter, assembles native membership clients.
+
+`ResolveVLLMGroveCapacity` verifies the complete DGD/PCS/PCSG/clique ownership
+chain and derives rendezvous from the exact rank-zero Pod. `ResolveVLLMMembership`
+composes direct per-Pod clients with the native membership adapter and a journal
+scoped to the physical clique UID. Resolution uses the production Pod-cache
+projection and does not contact vLLM: an API-unready joiner must not block launch
+delivery or membership preparation. Pod-bound launch lifetime remains separate
+from the native API instance ID pinned by membership observation.
+
+These pieces are not registered as a complete production RuntimeProvider.
+The admission webhook still rejects DGD opt-in and the default runtime remains
+unavailable. Worker traffic admission/drain, topology-bound serving verification,
+and startup composition that delivers initial launches before native observation
+remain required before deployment can be enabled. No synthetic admission or
+health-only verification is substituted for those contracts.
 The SGLang PoC's logical-only admission is not a replacement for this contract.
+
+This slice changes no API fields or generated schema. Including `engineGroup` in
+`UsesPCSG` selects its workload shape only; the existing hub-only creation block
+continues to use its unchanged conversion/preservation rules.

@@ -38,7 +38,38 @@ func ResolveVLLMLaunchProfile(source VLLMProfileGeometrySource) (ResolvedVLLMEla
 	if _, err := resolveVLLMNativeLaunchCommand(source); err != nil {
 		return ResolvedVLLMElasticEPProfile{}, err
 	}
+	if _, _, err := ResolveVLLMControlPorts(source); err != nil {
+		return ResolvedVLLMElasticEPProfile{}, err
+	}
 	return profile, nil
+}
+
+// ResolveVLLMControlPorts derives the native HTTP and DP rendezvous ports from a literal declaration.
+// This transport profile requires Pod-reachable HTTP, not a Unix socket or native TLS listener.
+func ResolveVLLMControlPorts(source VLLMProfileGeometrySource) (int32, int32, error) {
+	// Use the same option parser as launch validation, including duplicates and abbreviated-option rejection.
+	values, _, err := collectVLLMProfileOptions(source.Command, source.Args)
+	if err != nil {
+		return 0, 0, err
+	}
+	if host := values["--host"]; (host != "" && host != "0.0.0.0" && host != "::") ||
+		values["--uds"] != "" || values["--ssl-keyfile"] != "" || values["--ssl-certfile"] != "" {
+		return 0, 0, fmt.Errorf("vLLM Engine Group control requires an HTTP listener on all Pod interfaces")
+	}
+	ports := []int32{8000, 13445}
+	for i, name := range []string{"--port", "--data-parallel-rpc-port"} {
+		if literal, present := values[name]; present {
+			port, err := strconv.ParseInt(literal, 10, 32)
+			if err != nil || port < 1 || port > 65535 {
+				return 0, 0, fmt.Errorf("vLLM %s must be a valid TCP port", name)
+			}
+			ports[i] = int32(port)
+		}
+	}
+	if ports[0] == ports[1] {
+		return 0, 0, fmt.Errorf("vLLM HTTP and DP rendezvous ports must differ")
+	}
+	return ports[0], ports[1], nil
 }
 
 // RenderVLLMLaunchAssignment resolves one Pod's native command without changing caller-owned objects.
@@ -142,6 +173,9 @@ func renderVLLMNativeLaunch(source VLLMProfileGeometrySource, assignment vllmrun
 func resolveVLLMNativeLaunchCommand(source VLLMProfileGeometrySource) ([]string, error) {
 	// The bootstrap launches native vLLM, never the existing Dynamo wrapper or a shell supervisor.
 	argv := append(append([]string(nil), source.Command...), source.Args...)
+	if len(source.Command) == 0 {
+		return nil, fmt.Errorf("vLLM Engine Group bootstrap requires an explicit native command")
+	}
 	prefix := 0
 	if filepath.Base(argv[0]) == string(BackendFrameworkVLLM) && len(argv) >= 2 && argv[1] == "serve" {
 		prefix = 2

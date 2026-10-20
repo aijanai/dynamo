@@ -35,9 +35,11 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -103,9 +105,11 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=nvidia.com,resources=dynamographdeploymentenginegroups,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=nvidia.com,resources=dynamographdeploymentenginegroups/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=nvidia.com,resources=dynamographdeploymentenginegroups/finalizers,verbs=update
+// +kubebuilder:rbac:groups=nvidia.com,resources=dynamographdeployments,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=patch
 // +kubebuilder:rbac:groups=grove.io,resources=podcliques,verbs=get;list;watch
+// +kubebuilder:rbac:groups=grove.io,resources=podcliquesets;podcliquescalinggroups,verbs=get;list;watch
 // +kubebuilder:rbac:groups=grove.io,resources=podcliques/scale,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch
 
@@ -839,10 +843,14 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, groveEnabled bool) error
 	controller := ctrl.NewControllerManagedBy(mgr).
 		For(&nvidiacomv1beta1.DynamoGraphDeploymentEngineGroup{}).
 		Owns(&corev1.ConfigMap{}).
+		Watches(&nvidiacomv1beta1.DynamoGraphDeployment{}, handler.EnqueueRequestsFromMapFunc(r.engineGroupsForParent), builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.engineGroupsForCapacity)).
 		Named("dynamographdeploymentenginegroup")
 	if groveEnabled {
-		controller = controller.Watches(&grove.PodClique{}, handler.EnqueueRequestsFromMapFunc(r.engineGroupsForCapacity))
+		controller = controller.
+			Watches(&grove.PodClique{}, handler.EnqueueRequestsFromMapFunc(r.engineGroupsForCapacity)).
+			Watches(&grove.PodCliqueSet{}, handler.EnqueueRequestsFromMapFunc(r.engineGroupsForParent)).
+			Watches(&grove.PodCliqueScalingGroup{}, handler.EnqueueRequestsFromMapFunc(r.engineGroupsForParent))
 	}
 	return controller.Complete(r)
 }
