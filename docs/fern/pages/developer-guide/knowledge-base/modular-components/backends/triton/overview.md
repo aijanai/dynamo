@@ -19,7 +19,7 @@ That image is the build's `RUNTIME_IMAGE`, so the result is a single "Dynamo + T
 | Tensor (KServe gRPC) Serving                   |      Ready       | Multiple models per worker                                      |
 | Classification (`class_count` / top-K)         |      Ready       | Top-K `"<score>:<index>[:<label>]"` class strings               |
 | OpenAI `/v1/classify`                          |      Ready       | Text-in classifier (leaf or ensemble) via `--task classify`     |
-| OpenAI `/v1/embeddings`                        |      Ready       | Text-in embedding (leaf or ensemble) via `--task embeddings`         |
+| OpenAI `/v1/embeddings`                        |      Ready       | Text-in embedding (leaf or ensemble) via `--task embeddings`    |
 | Service Discovery / Routing                    |      Ready       | Via the Dynamo Frontend                                         |
 | Triton backends (TensorRT, ONNX, PyTorch, ...) |      Ready       | Whatever the Triton release image ships                         |
 | TensorRT Plugins                               |      Ready       | Via `--backend-config='tensorrt,plugins=...'`                   |
@@ -38,9 +38,10 @@ The Triton and KServe features below are not yet supported end-to-end through th
 
 > [!IMPORTANT]
 > **Discovery backend at scale.**
-> The `file` discovery backend suits small repositories and the examples below for simple quickstarts.
+> The `file` discovery backend suits small repositories and the examples below for a simple quickstart.
 > A worker that registers a large repository (hundreds of models) in a single burst overflows the file watcher's channels and can tear the frontend down before it reports ready.
-> Use the `etcd` discovery backend (`--discovery-backend=etcd`, with etcd running) for large repositories on baremetal. On Kubernetes, native k8s discovery will be used by default.
+> Use the `etcd` discovery backend (`--discovery-backend=etcd`, with etcd running) for large repositories on bare-metal.
+> On Kubernetes, native k8s discovery will be used by default.
 
 ## Container / driver matrix
 
@@ -106,18 +107,18 @@ The worker exposes the full `triton_runtime.Options` surface as CLI flags, named
 Run `python3 -m dynamo.triton --help` for the complete list.
 Common flags:
 
-| Option                          | Description                                                                                |
-| :------------------------------ | :----------------------------------------------------------------------------------------- |
-| `--model-repository <path>`     | Model repository to serve (default: `/models`)                                             |
-| `--backend-directory <path>`    | Triton backends directory (default: `/opt/tritonserver/backends`)                          |
-| `--backend-config <cfg>`        | Triton backend config, repeatable, e.g. `--backend-config='tensorrt,plugins=/path/lib.so'` |
-| `--log-verbose <int>`           | Triton verbose logging level; `0` disables, `>= 1` enables (default: `0`)                  |
-| `--discovery-backend <backend>` | Service discovery backend: `kubernetes`, `etcd`, `file`, `mem` (default: `etcd`)           |
-| `--task <task>`                 | Endpoint the worker registers: `tensor` (default), `classify`, or `embeddings` (see below)      |
-| `--classify-input-name <name>`  | Override the BYTES input tensor name for `--task classify` (auto-detected by default)      |
-| `--classify-output-name <name>` | Override the FP32 output tensor name for `--task classify` (auto-detected by default)      |
-| `--embeddings-input-name <name>`     | Override the BYTES input tensor name for `--task embeddings` (auto-detected by default)         |
-| `--embeddings-output-name <name>`    | Override the FP32 output tensor name for `--task embeddings` (auto-detected by default)         |
+| Option                               | Description                                                                                |
+| :----------------------------------- | :----------------------------------------------------------------------------------------- |
+| `--model-repository <path>`          | Model repository to serve (default: `/models`)                                             |
+| `--backend-directory <path>`         | Triton backends directory (default: `/opt/tritonserver/backends`)                          |
+| `--backend-config <cfg>`             | Triton backend config, repeatable, e.g. `--backend-config='tensorrt,plugins=/path/lib.so'` |
+| `--log-verbose <int>`                | Triton verbose logging level; `0` disables, `>= 1` enables (default: `0`)                  |
+| `--discovery-backend <backend>`      | Service discovery backend: `kubernetes`, `etcd`, `file`, `mem` (default: `etcd`)           |
+| `--task <task>`                      | Endpoint the worker registers: `tensor` (default), `classify`, or `embeddings` (see below) |
+| `--classify-input-name <name>`       | Override the BYTES input tensor name for `--task classify` (auto-detected by default)      |
+| `--classify-output-name <name>`      | Override the FP32 output tensor name for `--task classify` (auto-detected by default)      |
+| `--embeddings-input-name <name>`     | Override the BYTES input tensor name for `--task embeddings` (auto-detected by default)    |
+| `--embeddings-output-name <name>`    | Override the FP32 output tensor name for `--task embeddings` (auto-detected by default)    |
 
 ### Environment variables
 
