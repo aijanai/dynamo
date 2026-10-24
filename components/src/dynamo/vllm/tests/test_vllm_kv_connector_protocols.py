@@ -651,11 +651,12 @@ def test_nixl_push_decode_params_from_bootstrap():
     kv = NixlPushConnectorProtocol(
         _push_config()
     ).decode_request_kv_transfer_params_from_bootstrap(
-        _bootstrap(published), prefill_dp_rank=None
+        _bootstrap(published), prefill_dp_rank=None, request_id="req-1"
     )
     assert kv == {
         "do_remote_prefill": True,
         "do_remote_decode": False,
+        "remote_request_id": "req-1",
         "remote_engine_id": "eng-p",
         "remote_host": "10.0.0.7",
         "remote_port": 5700,
@@ -670,7 +671,7 @@ def test_nixl_push_decode_params_apply_prefill_dp_rank():
     kv = NixlPushConnectorProtocol(
         _push_config()
     ).decode_request_kv_transfer_params_from_bootstrap(
-        _bootstrap(published), prefill_dp_rank=2
+        _bootstrap(published), prefill_dp_rank=2, request_id="req-1"
     )
     # vLLM's EngineCore suffixes the engine id and offsets the side channel.
     assert kv["remote_engine_id"] == "eng-p_dp2"
@@ -683,7 +684,7 @@ def test_nixl_push_decode_needs_dp_rank_with_prefill_dp():
         NixlPushConnectorProtocol(
             _push_config()
         ).decode_request_kv_transfer_params_from_bootstrap(
-            _bootstrap(published), prefill_dp_rank=None
+            _bootstrap(published), prefill_dp_rank=None, request_id="req-1"
         )
 
 
@@ -692,7 +693,7 @@ def test_nixl_push_ignores_bootstrap_without_published_engine():
     proto = NixlPushConnectorProtocol(_push_config())
     assert (
         proto.decode_request_kv_transfer_params_from_bootstrap(
-            _bootstrap(None), prefill_dp_rank=None
+            _bootstrap(None), prefill_dp_rank=None, request_id="req-1"
         )
         is None
     )
@@ -706,7 +707,9 @@ def test_other_protocols_do_not_support_early_dispatch(fake_mooncake):
         assert proto.disaggregated_endpoint() is None
         assert (
             proto.decode_request_kv_transfer_params_from_bootstrap(
-                _bootstrap({"engine_id": "x", "tp_size": 1}), prefill_dp_rank=None
+                _bootstrap({"engine_id": "x", "tp_size": 1}),
+                prefill_dp_rank=None,
+                request_id="req-1",
             )
             is None
         )

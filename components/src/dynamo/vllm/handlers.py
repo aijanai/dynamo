@@ -3731,7 +3731,9 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
 
 
 class DecodeWorkerHandler(BaseWorkerHandler):
-    def _kv_params_from_bootstrap(self, request) -> Optional[Dict[str, Any]]:
+    def _kv_params_from_bootstrap(
+        self, request, request_id: str
+    ) -> Optional[Dict[str, Any]]:
         """``kv_transfer_params`` for a decode leg the router dispatched
         concurrently with its prefill, before any prefill result exists."""
         bootstrap_info = request.get("bootstrap_info")
@@ -3741,7 +3743,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         kv_params = make_kv_connector_protocol(
             self.engine_client.vllm_config
         ).decode_request_kv_transfer_params_from_bootstrap(
-            bootstrap_info, routing.get("prefill_dp_rank")
+            bootstrap_info, routing.get("prefill_dp_rank"), request_id
         )
         if kv_params is None:
             # Running the prefill locally would strand the blocks the
@@ -3994,7 +3996,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             is_decode_only = False
             mode = DisaggregationMode.AGGREGATED
         if kv_params is None and is_decode_only:
-            kv_params = self._kv_params_from_bootstrap(request)
+            kv_params = self._kv_params_from_bootstrap(request, request_id)
         has_external_encoder_result = request.get("encoder_result") is not None
         if has_external_encoder_result and mode != DisaggregationMode.AGGREGATED:
             yield {

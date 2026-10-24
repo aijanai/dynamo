@@ -54,7 +54,10 @@ class KvConnectorProtocol(ABC):
         return None
 
     def decode_request_kv_transfer_params_from_bootstrap(
-        self, bootstrap_info: Dict[str, Any], prefill_dp_rank: Optional[int]
+        self,
+        bootstrap_info: Dict[str, Any],
+        prefill_dp_rank: Optional[int],
+        request_id: str,
     ) -> Optional[Dict[str, Any]]:
         """``kv_transfer_params`` for a decode leg dispatched concurrently
         with its prefill, built from the router's ``bootstrap_info``."""
@@ -156,7 +159,10 @@ class NixlPushConnectorProtocol(NixlConnectorProtocol):
         return host, port, params
 
     def decode_request_kv_transfer_params_from_bootstrap(
-        self, bootstrap_info: Dict[str, Any], prefill_dp_rank: Optional[int]
+        self,
+        bootstrap_info: Dict[str, Any],
+        prefill_dp_rank: Optional[int],
+        request_id: str,
     ) -> Optional[Dict[str, Any]]:
         published = bootstrap_info.get("kv_transfer_params")
         if not published or "engine_id" not in published:
@@ -173,11 +179,12 @@ class NixlPushConnectorProtocol(NixlConnectorProtocol):
                 )
             engine_id = f"{engine_id}_dp{prefill_dp_rank}"
             port += prefill_dp_rank
-        # No remote_request_id: the prefill's internal id is not known yet,
-        # so vLLM skips lease heartbeats for these requests.
+        # Both legs run under the same Dynamo request id; vLLM pairs the
+        # push registration with the prefill by that id minus its suffix.
         return {
             "do_remote_prefill": True,
             "do_remote_decode": False,
+            "remote_request_id": request_id,
             "remote_engine_id": engine_id,
             "remote_host": bootstrap_info["bootstrap_host"],
             "remote_port": port,
